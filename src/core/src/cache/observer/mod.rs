@@ -41,6 +41,11 @@ impl Observer {
         self.runtime.consume_snapshot()
     }
 
+    /// Snapshot runtime counters WITHOUT resetting them (read-only reporting).
+    pub fn runtime_peek(&self) -> RuntimeStatsSnapshotInner {
+        self.runtime.peek_snapshot()
+    }
+
     /// Consume and clear the in-memory debug event trace.
     pub fn consume_event_trace(&self) -> EventTrace {
         self.event_tracer.drain()

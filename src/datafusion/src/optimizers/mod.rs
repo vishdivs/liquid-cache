@@ -21,9 +21,14 @@ use datafusion::{
 pub use lineage_opt::LineageOptimizer;
 
 use crate::{
-    LiquidCacheParquetRef, LiquidParquetSource,
+    CacheEngagementPolicy, LiquidCacheParquetRef, LiquidParquetSource, default_engagement_policy,
     optimizers::lineage_opt::{ColumnAnnotation, metadata_from_factory, serialize_date_part},
 };
+
+/// Default maximum number of projected output columns for which LC wrapping is
+/// applied. Above this, per-column cache overhead tends to exceed decode savings,
+/// so the scan is left as a plain `ParquetSource`.
+pub const DEFAULT_MAX_LC_COLUMNS: usize = 4;
 
 pub(crate) const DATE_MAPPING_METADATA_KEY: &str = "liquid.cache.date_mapping";
 pub(crate) const STRING_FINGERPRINT_METADATA_KEY: &str = "liquid.cache.string_fingerprint";
@@ -35,17 +40,38 @@ pub(crate) const STRING_FINGERPRINT_METADATA_KEY: &str = "liquid.cache.string_fi
 #[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
+    max_projected_columns: usize,
+    engagement_policy: Arc<dyn CacheEngagementPolicy>,
 }
 
 impl LocalModeOptimizer {
     /// Create an optimizer with an existing cache instance
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_projected_columns: DEFAULT_MAX_LC_COLUMNS,
+            engagement_policy: default_engagement_policy(),
+        }
     }
 
     /// Create an optimizer with an existing cache instance
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self::new(cache)
+    }
+
+    /// Set the maximum number of projected output columns for which the scan is
+    /// wrapped with liquid cache. Scans projecting more columns are left as plain
+    /// `ParquetSource`. Defaults to [`DEFAULT_MAX_LC_COLUMNS`].
+    pub fn with_max_projected_columns(mut self, max_projected_columns: usize) -> Self {
+        self.max_projected_columns = max_projected_columns;
+        self
+    }
+
+    /// Set the cache engagement policy applied to wrapped scans at file-open time.
+    /// Defaults to [`default_engagement_policy`].
+    pub fn with_engagement_policy(mut self, policy: Arc<dyn CacheEngagementPolicy>) -> Self {
+        self.engagement_policy = policy;
+        self
     }
 }
 
@@ -55,7 +81,12 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        Ok(rewrite_data_source_plan(plan, &self.cache))
+        Ok(rewrite_data_source_plan_with_config(
+            plan,
+            &self.cache,
+            self.max_projected_columns,
+            &self.engagement_policy,
+        ))
     }
 
     fn name(&self) -> &str {
@@ -69,13 +100,27 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     }
 }
 
-/// Rewrite the data source plan to use liquid cache.
+/// Rewrite the data source plan to use liquid cache, using default configuration
+/// ([`DEFAULT_MAX_LC_COLUMNS`] and [`default_engagement_policy`]).
 pub fn rewrite_data_source_plan(
     plan: Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
 ) -> Arc<dyn ExecutionPlan> {
+    let engagement_policy = default_engagement_policy();
+    rewrite_data_source_plan_with_config(plan, cache, DEFAULT_MAX_LC_COLUMNS, &engagement_policy)
+}
+
+/// Rewrite the data source plan to use liquid cache with explicit configuration.
+pub fn rewrite_data_source_plan_with_config(
+    plan: Arc<dyn ExecutionPlan>,
+    cache: &LiquidCacheParquetRef,
+    max_projected_columns: usize,
+    engagement_policy: &Arc<dyn CacheEngagementPolicy>,
+) -> Arc<dyn ExecutionPlan> {
     let rewritten = plan
-        .transform_up(|node| try_optimize_parquet_source(node, cache))
+        .transform_up(|node| {
+            try_optimize_parquet_source(node, cache, max_projected_columns, engagement_policy)
+        })
         .unwrap();
     rewritten.data
 }
@@ -97,6 +142,8 @@ fn is_uncacheable_type(dt: &arrow_schema::DataType) -> bool {
 fn try_optimize_parquet_source(
     plan: Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
+    max_projected_columns: usize,
+    engagement_policy: &Arc<dyn CacheEngagementPolicy>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>, datafusion::error::DataFusionError> {
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
         && let Some((file_scan_config, parquet_source)) =
@@ -114,11 +161,11 @@ fn try_optimize_parquet_source(
 
         // Skip LC when too many output columns — per-column cache overhead
         // exceeds decode savings for wide projections.
-        const MAX_LC_COLUMNS: usize = 4;
-        if output_schema.fields().len() > MAX_LC_COLUMNS {
+        if output_schema.fields().len() > max_projected_columns {
             log::debug!(
                 "[LC-Optimizer] SKIP: too many columns ({} > {})",
-                output_schema.fields().len(), MAX_LC_COLUMNS
+                output_schema.fields().len(),
+                max_projected_columns
             );
             return Ok(Transformed::no(plan));
         }
@@ -158,7 +205,8 @@ fn try_optimize_parquet_source(
         let mut new_config = file_scan_config.clone();
 
         let mut new_source =
-            LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone());
+            LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())
+                .with_engagement_policy(Arc::clone(engagement_policy));
         if let Some(expr_adapter_factory) = file_scan_config.expr_adapter_factory.as_ref() {
             let new_schema =
                 enrich_source_schema(file_scan_config.file_schema(), expr_adapter_factory);
@@ -228,13 +276,63 @@ mod tests {
 
     use super::*;
 
+    /// Extract the file schema of the (first) parquet scan in a plan.
+    fn scan_file_schema(plan: &Arc<dyn ExecutionPlan>) -> SchemaRef {
+        let mut schema = None;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
+            {
+                schema = Some(cfg.file_schema().clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        schema.expect("plan should contain a parquet file scan")
+    }
+
     async fn rewrite_plan_inner(plan: Arc<dyn ExecutionPlan>) {
-        let expected_schema = plan.schema();
+        // Capture the scan's file schema before the rewrite so we can assert the
+        // optimizer wraps the scan without corrupting its file schema.
+        let original_file_schema = scan_file_schema(&plan);
+        let liquid_cache = build_test_cache().await;
+        let rewritten = rewrite_data_source_plan(plan, &liquid_cache);
+
+        let mut wrapped = false;
+        rewritten
+            .apply(|node| {
+                if let Some(exec) = node.downcast_ref::<DataSourceExec>() {
+                    let source = exec.data_source();
+                    let cfg = source.downcast_ref::<FileScanConfig>().unwrap();
+                    // The scan must be wrapped with liquid cache ...
+                    cfg.file_source()
+                        .downcast_ref::<LiquidParquetSource>()
+                        .unwrap();
+                    wrapped = true;
+                    // ... and the file schema must be preserved unchanged.
+                    assert_eq!(cfg.file_schema().as_ref(), original_file_schema.as_ref());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert!(
+            wrapped,
+            "expected scan to be wrapped in LiquidParquetSource"
+        );
+    }
+
+    async fn build_test_cache() -> LiquidCacheParquetRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+        // direct_io (O_DIRECT) is Linux-only; fall back to buffered I/O elsewhere
+        // so the test runs on macOS/Windows too.
+        let mount_options = t4::MountOptions {
+            direct_io: cfg!(target_os = "linux"),
+            ..Default::default()
+        };
+        let store = t4::mount_with_options(tmp_dir.path().join("liquid_cache.t4"), mount_options)
             .await
             .unwrap();
-        let liquid_cache = Arc::new(
+        Arc::new(
             LiquidCacheParquet::new(
                 8192,
                 1000000,
@@ -245,23 +343,61 @@ mod tests {
                 Box::new(AlwaysHydrate::new()),
             )
             .await,
-        );
-        let rewritten = rewrite_data_source_plan(plan, &liquid_cache);
+        )
+    }
 
-        rewritten
-            .apply(|node| {
-                if let Some(plan) = node.downcast_ref::<DataSourceExec>() {
-                    let data_source = plan.data_source();
-                    let source = data_source.downcast_ref::<FileScanConfig>().unwrap();
-                    let file_source = source.file_source();
-                    let _parquet_source =
-                        file_source.downcast_ref::<LiquidParquetSource>().unwrap();
-                    let schema = source.file_schema().as_ref();
-                    assert_eq!(schema, expected_schema.as_ref());
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
+    fn has_liquid_source(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
+                && cfg
+                    .file_source()
+                    .downcast_ref::<LiquidParquetSource>()
+                    .is_some()
+            {
+                found = true;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    /// The max-projected-columns knob gates whether a scan is wrapped. With a cap
+    /// of 0, any non-empty projection is left as a plain parquet scan; with the
+    /// default cap the same plan is wrapped.
+    #[tokio::test]
+    async fn max_projected_columns_gates_wrapping() {
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nano_hits",
+            "../../examples/nano_hits.parquet",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let df = ctx
+            .sql("SELECT \"WatchID\" FROM nano_hits LIMIT 10")
+            .await
             .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let cache = build_test_cache().await;
+        let engagement = default_engagement_policy();
+
+        // Cap of 0: the single-column projection exceeds the cap, so no wrapping.
+        let capped = rewrite_data_source_plan_with_config(plan.clone(), &cache, 0, &engagement);
+        assert!(
+            !has_liquid_source(&capped),
+            "max_projected_columns=0 must leave the scan as plain parquet"
+        );
+
+        // Default cap: the same plan is wrapped with liquid cache.
+        let wrapped = rewrite_data_source_plan(plan, &cache);
+        assert!(
+            has_liquid_source(&wrapped),
+            "default cap must wrap a narrow numeric projection"
+        );
     }
 
     #[tokio::test]
@@ -274,8 +410,10 @@ mod tests {
         )
         .await
         .unwrap();
+        // Narrow numeric projection so the scan qualifies for LC wrapping; a wide
+        // `SELECT *` with string columns is intentionally skipped by the optimizer.
         let df = ctx
-            .sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
+            .sql("SELECT \"WatchID\" FROM nano_hits WHERE \"WatchID\" > 0 limit 10")
             .await
             .unwrap();
         let plan = df.create_physical_plan().await.unwrap();

@@ -219,6 +219,54 @@ impl SqueezePolicy for TranscodeEvict {
     }
 }
 
+/// In-memory-only squeeze policy.
+///
+/// Reclaims memory purely within RAM and never spills to disk:
+/// - `MemoryArrow` is transcoded to the compact `MemoryLiquid` form. If a value
+///   cannot be transcoded (e.g. an unsupported type), it is evicted rather than
+///   written to disk.
+/// - `MemoryLiquid` is already the compact in-memory representation, so under
+///   further pressure it is evicted outright.
+///
+/// Any disk-backed or squeezed states are treated as evictable; they never arise
+/// when this policy is the only one in use, but are handled for completeness.
+///
+/// Pair this with a cache configured for zero disk capacity so the fallback
+/// disk-write path in the insert loop is never taken (it will report the cache
+/// as full and the reader will fall back to reading Parquet directly).
+#[derive(Debug, Default, Clone)]
+pub struct TranscodeEvictInMemory;
+
+impl SqueezePolicy for TranscodeEvictInMemory {
+    fn squeeze(
+        &self,
+        entry: &CacheEntry,
+        compressor: &LiquidCompressorStates,
+        _squeeze_hint: Option<&CacheExpression>,
+        _squeeze_io: &Arc<dyn SqueezeIoHandler>,
+    ) -> SqueezeOutcome {
+        match entry {
+            // First step under pressure: compress Arrow -> Liquid, staying in memory.
+            CacheEntry::MemoryArrow(array) => {
+                match transcode_liquid_inner_with_hint(array, compressor, None) {
+                    Ok(liquid_array) => SqueezeOutcome::Replace {
+                        entry: CacheEntry::memory_liquid(liquid_array),
+                        bytes_to_write: None,
+                    },
+                    // Can't compress and we refuse to spill: drop the entry.
+                    Err(_) => SqueezeOutcome::Remove,
+                }
+            }
+            // Already the compact in-memory form and still over budget: evict.
+            CacheEntry::MemoryLiquid(_) => SqueezeOutcome::Remove,
+            // These do not occur under this policy; evict to stay memory-only.
+            CacheEntry::MemorySqueezedLiquid(_)
+            | CacheEntry::DiskLiquid { .. }
+            | CacheEntry::DiskArrow { .. } => SqueezeOutcome::Remove,
+        }
+    }
+}
+
 pub(crate) fn try_variant_squeeze(
     array: &ArrayRef,
     requests: &[VariantRequest],
@@ -543,6 +591,71 @@ mod tests {
             &squeeze_io,
         );
         assert!(matches!(b2, SqueezeOutcome::Remove));
+    }
+
+    #[test]
+    fn test_transcode_evict_in_memory_policy() {
+        let policy = TranscodeEvictInMemory;
+        let states = LiquidCompressorStates::new();
+        let squeeze_io: Arc<dyn SqueezeIoHandler> = Arc::new(TestSqueezeIo::default());
+
+        // MemoryArrow -> MemoryLiquid, no disk bytes, and the data round-trips.
+        let arr = int_array(8);
+        let (new_batch, bytes) = into_replace(policy.squeeze(
+            &CacheEntry::memory_arrow(arr.clone()),
+            &states,
+            None,
+            &squeeze_io,
+        ));
+        assert!(bytes.is_none(), "in-memory policy must never write bytes");
+        match new_batch {
+            CacheEntry::MemoryLiquid(liq) => {
+                assert_eq!(liq.to_arrow_array().as_ref(), arr.as_ref());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // MemoryLiquid -> Remove (already compact; evict under further pressure).
+        let liquid = transcode_liquid_inner(&int_array(4), &states).unwrap();
+        let outcome = policy.squeeze(
+            &CacheEntry::memory_liquid(liquid),
+            &states,
+            None,
+            &squeeze_io,
+        );
+        assert!(matches!(outcome, SqueezeOutcome::Remove));
+
+        // Untranscodable input (struct) -> Remove instead of spilling to disk.
+        let outcome = policy.squeeze(
+            &CacheEntry::memory_arrow(struct_array()),
+            &states,
+            None,
+            &squeeze_io,
+        );
+        assert!(
+            matches!(outcome, SqueezeOutcome::Remove),
+            "untranscodable arrow must be evicted, not spilled"
+        );
+
+        // Any disk-backed states are evictable.
+        assert!(matches!(
+            policy.squeeze(
+                &CacheEntry::disk_arrow(DataType::Utf8, 1),
+                &states,
+                None,
+                &squeeze_io,
+            ),
+            SqueezeOutcome::Remove
+        ));
+        assert!(matches!(
+            policy.squeeze(
+                &CacheEntry::disk_liquid(DataType::Utf8, 1),
+                &states,
+                None,
+                &squeeze_io,
+            ),
+            SqueezeOutcome::Remove
+        ));
     }
 
     #[test]

@@ -13,9 +13,12 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
-use liquid_cache_datafusion::optimizers::{LineageOptimizer, LocalModeOptimizer};
+use liquid_cache_datafusion::optimizers::{
+    DEFAULT_MAX_LC_COLUMNS, LineageOptimizer, LocalModeOptimizer,
+};
 use liquid_cache_datafusion::{
-    LiquidCacheParquet, VariantGetUdf, VariantPretty, VariantToJsonUdf,
+    CacheEngagementPolicy, LiquidCacheParquet, VariantGetUdf, VariantPretty, VariantToJsonUdf,
+    default_engagement_policy,
 };
 
 pub use liquid_cache as storage;
@@ -70,6 +73,15 @@ pub struct LiquidCacheLocalBuilder {
     squeeze_policy: Box<dyn SqueezePolicy>,
     /// Hydration policy
     hydration_policy: Box<dyn HydrationPolicy>,
+    /// Whether to register the lineage (date/variant EXTRACT) logical optimizer.
+    /// Enabled by default; disable to skip its per-query planning cost when the
+    /// workload never benefits from date-component/variant squeezing.
+    enable_lineage_optimizer: bool,
+    /// Maximum number of projected output columns for which a scan is wrapped
+    /// with liquid cache. Wider projections are left as plain parquet scans.
+    max_projected_columns: usize,
+    /// Per-file cache engagement policy (e.g. selectivity threshold).
+    engagement_policy: Arc<dyn CacheEngagementPolicy>,
     span: fastrace::Span,
 }
 
@@ -85,6 +97,9 @@ impl Default for LiquidCacheLocalBuilder {
             cache_policy: Box::new(LiquidPolicy::new()),
             squeeze_policy: Box::new(TranscodeSqueezeEvict),
             hydration_policy: Box::new(AlwaysHydrate::new()),
+            enable_lineage_optimizer: true,
+            max_projected_columns: DEFAULT_MAX_LC_COLUMNS,
+            engagement_policy: default_engagement_policy(),
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -140,6 +155,33 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
+    /// Enable or disable the lineage (date/variant `EXTRACT`) logical optimizer.
+    ///
+    /// Enabled by default to match upstream behavior. Disabling skips registering
+    /// the rule, avoiding its per-query planning cost. This is safe for workloads
+    /// that do not rely on date-component or variant-field squeezing (e.g. plain
+    /// numeric/date/boolean projections); results are unaffected either way.
+    pub fn with_lineage_optimizer(mut self, enable: bool) -> Self {
+        self.enable_lineage_optimizer = enable;
+        self
+    }
+
+    /// Set the maximum number of projected output columns for which a scan is
+    /// wrapped with liquid cache. Scans projecting more columns are left as plain
+    /// parquet scans. Defaults to [`DEFAULT_MAX_LC_COLUMNS`].
+    pub fn with_max_projected_columns(mut self, max_projected_columns: usize) -> Self {
+        self.max_projected_columns = max_projected_columns;
+        self
+    }
+
+    /// Set the per-file cache engagement policy (e.g. a selectivity threshold that
+    /// delegates low-selectivity predicate scans to plain parquet). Defaults to
+    /// [`default_engagement_policy`].
+    pub fn with_engagement_policy(mut self, policy: Arc<dyn CacheEngagementPolicy>) -> Self {
+        self.engagement_policy = policy;
+        self
+    }
+
     /// Set fastrace span
     pub fn with_span(mut self, span: fastrace::Span) -> Self {
         self.span = span;
@@ -162,7 +204,15 @@ impl LiquidCacheLocalBuilder {
         config.options_mut().execution.parquet.skip_metadata = false;
         config.options_mut().execution.batch_size = self.batch_size;
 
-        let store = t4::mount(self.cache_dir.join("liquid_cache.t4"))
+        // Disk tier: O_DIRECT + O_DSYNC on Linux (production default). Other
+        // platforms fall back to buffered I/O — macOS/Windows have no O_DIRECT
+        // — which changes durability characteristics of the disk tier only,
+        // never correctness; the in-memory cache is identical everywhere.
+        let mount_options = t4::MountOptions {
+            direct_io: cfg!(target_os = "linux"),
+            ..Default::default()
+        };
+        let store = t4::mount_with_options(self.cache_dir.join("liquid_cache.t4"), mount_options)
             .await
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         #[cfg(not(test))]
@@ -191,14 +241,17 @@ impl LiquidCacheLocalBuilder {
         .await;
         let cache_ref = Arc::new(cache);
 
-        let date_extract_optimizer = Arc::new(LineageOptimizer::new());
+        let optimizer = LocalModeOptimizer::new(cache_ref.clone())
+            .with_max_projected_columns(self.max_projected_columns)
+            .with_engagement_policy(self.engagement_policy.clone());
 
-        let optimizer = LocalModeOptimizer::new(cache_ref.clone());
-
-        let state = datafusion::execution::SessionStateBuilder::new()
+        let mut state_builder = datafusion::execution::SessionStateBuilder::new()
             .with_config(config)
-            .with_default_features()
-            .with_optimizer_rule(date_extract_optimizer)
+            .with_default_features();
+        if self.enable_lineage_optimizer {
+            state_builder = state_builder.with_optimizer_rule(Arc::new(LineageOptimizer::new()));
+        }
+        let state = state_builder
             .with_physical_optimizer_rule(Arc::new(optimizer))
             .build();
 

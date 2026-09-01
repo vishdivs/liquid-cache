@@ -98,7 +98,7 @@ impl LiquidCache {
 
         let memory_usage_bytes = self.budget.memory_usage_bytes();
         let disk_usage_bytes = self.budget.disk_usage_bytes();
-        let runtime = self.observer.runtime_snapshot();
+        let runtime = self.observer.runtime_peek();
 
         CacheStats {
             total_entries,

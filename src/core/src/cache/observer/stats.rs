@@ -53,6 +53,18 @@ macro_rules! define_runtime_stats {
                 v
             }
 
+            /// Return an immutable snapshot of the current runtime counters WITHOUT
+            /// resetting them. Use for read-only reporting (e.g. the stats REST
+            /// endpoint) where counters must accumulate monotonically instead of
+            /// being drained on every read.
+            pub fn peek_snapshot(&self) -> RuntimeStatsSnapshot {
+                RuntimeStatsSnapshot {
+                    $(
+                        $field: self.$field.load(Ordering::Relaxed),
+                    )*
+                }
+            }
+
             $(
                 /// Increment counter.
                 #[inline]
